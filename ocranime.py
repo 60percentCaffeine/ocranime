@@ -1372,6 +1372,266 @@ def _get_video_dimensions(video_path):
     return int(w), int(h)
 
 
+def _get_video_duration(video_path):
+    """Return duration in seconds of the first video stream via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        check=True, capture_output=True, text=True,
+    )
+    return float(result.stdout.strip())
+
+
+DEFAULT_CROP = "iw*0.7:ih*0.15:iw*0.15:ih*0.8"
+
+
+def _is_target_char(ch, languages):
+    """Return True if ch belongs to the target language's writing system."""
+    # CJK Unified Ideographs — shared by Chinese & Japanese
+    if "一" <= ch <= "鿿":
+        return True
+    if "㐀" <= ch <= "䶿":   # CJK Extension A
+        return True
+    if "豈" <= ch <= "﫿":   # CJK Compatibility Ideographs
+        return True
+    if "\U00020000" <= ch <= "\U0002A6DF":  # CJK Extension B
+        return True
+    for lang in languages:
+        low = lang.lower()
+        if low.startswith("ja") and "぀" <= ch <= "ヿ":
+            return True
+        if low.startswith("ko") and "가" <= ch <= "힯":
+            return True
+        if low.startswith("en") and (("A" <= ch <= "Z") or ("a" <= ch <= "z")):
+            return True
+    return False
+
+
+def auto_detect_crop(video_path, languages, width_mode):
+    """Auto-detect ffmpeg crop region by pre-scanning the video.
+
+    Returns an ffmpeg crop string ``w:h:x:y``.  Falls back to ``DEFAULT_CROP``
+    when no plausible subtitle cluster is found.
+    """
+    import numpy as np
+
+    K = 6
+    WINDOW_DUR = 8
+    fps = 4
+
+    try:
+        iw, ih = _get_video_dimensions(video_path)
+        duration = _get_video_duration(video_path)
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        print(f"auto-crop: could not read video metadata ({exc}); using default crop")
+        return DEFAULT_CROP
+
+    # Pick K windows from the middle 80% so OP/ED don't bias the clusters
+    span_start = duration * 0.10
+    span_end = duration * 0.90
+    span = max(0.0, span_end - span_start)
+    if span <= WINDOW_DUR:
+        # Very short video — sample once from the start of the middle 80% region
+        starts = [max(0.0, span_start)]
+    else:
+        slot = span / K
+        offset = max(0.0, (slot - WINDOW_DUR) / 2)
+        starts = [span_start + i * slot + offset for i in range(K)]
+
+    print(f"auto-crop: pre-scanning {len(starts)} windows × {WINDOW_DUR}s @ {fps}fps "
+          f"(video {iw}x{ih}, duration {duration:.0f}s)...")
+
+    with tempfile.TemporaryDirectory(prefix="ocranime_autocrop_") as tmpdir:
+        for window_idx, start_t in enumerate(starts):
+            cmd = [
+                "ffmpeg",
+                "-ss", f"{start_t:.3f}",
+                "-i", str(video_path),
+                "-t", str(WINDOW_DUR),
+                "-vf", f"fps={fps}",
+                "-loglevel", "error",
+                os.path.join(tmpdir, f"w{window_idx:02d}_%06d.png"),
+            ]
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as exc:
+                print(f"auto-crop: ffmpeg failed on window {window_idx} (t={start_t:.1f}s): {exc}")
+
+        frames = sorted(Path(tmpdir).glob("*.png"))
+        if not frames:
+            print("auto-crop: no frames extracted; using default crop")
+            return DEFAULT_CROP
+
+        _, frame_lines = detect_text_frames_screenai(
+            frames, languages, num_workers=None, batch_size=64,
+        )
+
+    all_h = [h for lines in frame_lines for _, _, _, _, h in lines if h > 0]
+    if not all_h:
+        print("auto-crop: pre-scan found no text; using default crop")
+        return DEFAULT_CROP
+    cluster_ranges = cluster_heights(all_h)
+    if not cluster_ranges:
+        print("auto-crop: no height clusters formed; using default crop")
+        return DEFAULT_CROP
+
+    num_frames = len(frame_lines)
+
+    def _densest_y_band(bboxes, band_h):
+        """Pick the densest Y window of height ``band_h`` and return its bboxes.
+
+        Within a single height cluster the bboxes may span multiple Y regions
+        (e.g. a top-of-frame banner with the same character height as the
+        bottom subtitle band).  The genuine subtitle band is the densest
+        single Y window; filter to that so the rest of the heuristic measures
+        the subtitles, not a mash-up.
+        """
+        if not bboxes:
+            return bboxes
+        ys = sorted(b[2] for b in bboxes)
+        best_count = 0
+        best_lo = ys[0]
+        i = 0
+        for j in range(len(ys)):
+            while ys[j] - ys[i] > band_h:
+                i += 1
+            count = j - i + 1
+            if count > best_count:
+                best_count = count
+                best_lo = ys[i]
+        best_hi = best_lo + band_h
+        return [b for b in bboxes if best_lo <= b[2] <= best_hi]
+
+    cluster_data = []
+    for cmin, cmax in cluster_ranges:
+        bboxes = []
+        for fi, lines in enumerate(frame_lines):
+            for text, x, y, w, h in lines:
+                if cmin <= h <= cmax:
+                    bboxes.append((text, x, y, w, h, fi))
+        if not bboxes:
+            continue
+
+        heights_all = np.array([b[4] for b in bboxes], dtype=np.float64)
+        median_h_all = float(np.median(heights_all))
+        # Allow ~4 text-heights of vertical room: a tight one- or two-line band
+        # plus a little slack for line-spacing jitter.
+        band_h = max(8.0, 4.0 * median_h_all)
+        band_bboxes = _densest_y_band(bboxes, band_h)
+        if not band_bboxes:
+            band_bboxes = bboxes
+
+        frames_with = {b[5] for b in band_bboxes}
+        frame_coverage = len(frames_with) / num_frames
+        ys = np.array([b[2] for b in band_bboxes], dtype=np.float64)
+        widths = np.array([b[3] for b in band_bboxes], dtype=np.float64)
+        heights = np.array([b[4] for b in band_bboxes], dtype=np.float64)
+        x_centers = np.array([b[1] + b[3] / 2 for b in band_bboxes], dtype=np.float64)
+
+        median_h = float(np.median(heights))
+        median_w = float(np.median(widths))
+        y_dispersion = float(np.std(ys))
+        # Kept for diagnostics only — the spec's "stdev of centers / median width"
+        # wrongly punishes centred subtitles whose centres all sit at iw/2.
+        x_spread = float(np.std(x_centers)) / median_w if median_w > 0 else 0.0
+        y_median = float(np.median(ys))
+
+        target_count = 0
+        total_count = 0
+        for b in band_bboxes:
+            for c in b[0]:
+                if c.isspace():
+                    continue
+                total_count += 1
+                if _is_target_char(c, languages):
+                    target_count += 1
+        cjk_ratio = target_count / total_count if total_count > 0 else 0.0
+
+        size_sanity = 1.0 if (ih * 0.025 <= median_h <= ih * 0.10) else 0.3
+        y_disp_factor = 1.0 / (1.0 + y_dispersion / median_h) if median_h > 0 else 0.0
+        # Subtitles overwhelmingly live in the lower half of the frame.  Treat
+        # y_median / ih as a soft prior: full credit at the bottom, gentle
+        # penalty at the top.  Clamped to keep the score from collapsing to 0.
+        bottom_bias = max(0.3, min(1.0, y_median / ih))
+        score = frame_coverage * cjk_ratio * size_sanity * y_disp_factor * bottom_bias
+
+        cluster_data.append({
+            "cmin": cmin, "cmax": cmax, "score": score,
+            "bboxes": [(b[0], b[1], b[2], b[3], b[4]) for b in band_bboxes],
+            "frame_coverage": frame_coverage, "cjk_ratio": cjk_ratio,
+            "x_spread": x_spread, "y_dispersion": y_dispersion,
+            "median_h": median_h, "y_median": y_median,
+        })
+
+    if not cluster_data:
+        print("auto-crop: no scorable clusters; using default crop")
+        return DEFAULT_CROP
+
+    cluster_data.sort(key=lambda d: d["score"], reverse=True)
+    print(f"auto-crop: {len(cluster_data)} cluster(s):", flush=True)
+    for i, d in enumerate(cluster_data):
+        print(f"  [{i}] h=[{d['cmin']},{d['cmax']}] score={d['score']:.3f} "
+              f"coverage={d['frame_coverage']:.2f} cjk={d['cjk_ratio']:.2f} "
+              f"x_spread={d['x_spread']:.2f} y_disp={d['y_dispersion']:.1f} "
+              f"median_h={d['median_h']:.0f} y_median={d['y_median']:.0f} "
+              f"({len(d['bboxes'])} bboxes)", flush=True)
+
+    winner = cluster_data[0]
+    if winner["score"] <= 0:
+        print("auto-crop: top cluster scored zero; using default crop")
+        return DEFAULT_CROP
+
+    if len(cluster_data) >= 2:
+        top1, top2 = cluster_data[0], cluster_data[1]
+        if top2["score"] > 0 and (top1["score"] - top2["score"]) / top1["score"] < 0.10:
+            if (top1["y_median"] < ih / 2) != (top2["y_median"] < ih / 2):
+                print("auto-crop: top two clusters are close-scoring and sit on opposite "
+                      "halves of the frame — consider re-running with --crop2.")
+
+    C = winner["bboxes"]
+    H = winner["median_h"]
+
+    if width_mode == "full":
+        x1, x2 = 0.0, float(iw)
+    else:  # "pad"
+        widest = max(C, key=lambda b: b[3])
+        wx, ww = widest[1], widest[3]
+        x1 = max(0.0, wx - 0.20 * ww)
+        x2 = min(float(iw), wx + ww + 0.20 * ww)
+
+    y1 = float(min(b[2] for b in C))
+    y2 = float(max(b[2] + b[4] for b in C))
+    if (y2 - y1) < 1.8 * H:
+        y1 -= H
+        y2 += H
+    y1 = max(0.0, y1)
+    y2 = min(float(ih), y2)
+
+    # Snap to even pixels (some codecs require even crop dimensions)
+    x1_i = int(x1) - (int(x1) % 2)
+    y1_i = int(y1) - (int(y1) % 2)
+    x2_i = int(x2) + (int(x2) % 2)
+    y2_i = int(y2) + (int(y2) % 2)
+    x1_i = max(0, x1_i)
+    y1_i = max(0, y1_i)
+    x2_i = min(iw, x2_i)
+    y2_i = min(ih, y2_i)
+
+    w = x2_i - x1_i
+    h = y2_i - y1_i
+
+    if w <= 0 or h <= 0:
+        print("auto-crop: derived crop is empty; using default crop")
+        return DEFAULT_CROP
+    if w * h > 0.9 * iw * ih:
+        print(f"auto-crop: derived crop {w}x{h} covers >90% of frame; using default crop")
+        return DEFAULT_CROP
+
+    crop = f"{w}:{h}:{x1_i}:{y1_i}"
+    print(f"auto-crop: selected cluster h=[{winner['cmin']},{winner['cmax']}] -> crop={crop}")
+    return crop
+
+
 def filter_blind_spot_bboxes(frame_lines, rect):
     """Drop bboxes wholly contained inside rect=(x1, y1, x2, y2).
 
@@ -1608,14 +1868,23 @@ def main():
     crop_group = parser.add_mutually_exclusive_group()
     crop_group.add_argument(
         "--crop",
-        default="iw*0.7:ih*0.15:iw*0.15:ih*0.8",
-        help="ffmpeg crop filter (default: iw*0.7:ih*0.15:iw*0.15:ih*0.8)",
+        default="auto",
+        help=(f"ffmpeg crop filter, or 'auto' to derive it from a pre-scan "
+              f"(default: auto; manual fallback: {DEFAULT_CROP})"),
     )
     crop_group.add_argument(
         "--crop2",
         nargs=2,
         metavar=("TOP_CROP", "BOTTOM_CROP"),
         help="Two ffmpeg crop filters (top and bottom regions) vstacked together",
+    )
+    parser.add_argument(
+        "--auto-crop-width",
+        default="pad",
+        choices=["pad", "full"],
+        help=("How --crop=auto sets horizontal extents: 'pad' fits the widest "
+              "bbox and adds 20%% on each side, 'full' uses the whole frame width "
+              "(default: pad)"),
     )
     parser.add_argument(
         "--fps", type=int, default=4, help="Frames per second to sample (default: 4)"
@@ -1724,12 +1993,16 @@ def main():
         fps = args.fps
         sample_interval = 1.0 / fps
 
+        crop = args.crop
+        if not args.crop2 and crop == "auto":
+            crop = auto_detect_crop(video_path, args.languages, args.auto_crop_width)
+
         with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
             print(f"Extracting frames ({fps} fps)...")
             if args.crop2:
                 frames = extract_frames_crop2(video_path, tmpdir, args.crop2, fps)
             else:
-                frames = extract_frames(video_path, tmpdir, args.crop, fps)
+                frames = extract_frames(video_path, tmpdir, crop, fps)
             print(f"Extracted {len(frames)} frames")
 
             # OCR all frames
@@ -1747,7 +2020,7 @@ def main():
             if args.blind_spot and raw_frame_lines is not None:
                 vw, vh = _get_video_dimensions(video_path)
                 rect = parse_blind_spot(args.blind_spot, vw, vh)
-                cx, cy = _parse_crop_offsets(args.crop, vw, vh)
+                cx, cy = _parse_crop_offsets(crop, vw, vh)
                 rect = (rect[0] - cx, rect[1] - cy, rect[2] - cx, rect[3] - cy)
                 raw_frame_lines = filter_blind_spot_bboxes(raw_frame_lines, rect)
                 all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
