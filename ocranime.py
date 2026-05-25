@@ -1145,6 +1145,11 @@ def smart_deduplicate(entries, sample_interval):
         is_single_frame = abs(duration - sample_interval) < 1e-4
         if is_single_frame and _texts_similar(text, current_text):
             current_end = end
+            # Prefer the longer text — OCR often catches fewer characters in
+            # some frames (e.g. an edge character drops out), and the longer
+            # variant is more likely the correct transcription.
+            if len(text) > len(current_text):
+                current_text = text
             skip.add(i)
             continue
         merged.append((current_text, current_start, current_end))
@@ -1160,11 +1165,12 @@ def smart_deduplicate(entries, sample_interval):
         duration = round(end - start, 6)
         is_single_frame = abs(duration - sample_interval) < 1e-4
         if is_single_frame and i + 1 < len(merged):
-            next_text = merged[i + 1][1]
             next_entry_text = merged[i + 1][0]
             if _texts_similar(text, next_entry_text):
-                # Extend next entry's start to absorb this one
-                merged[i + 1] = (merged[i + 1][0], start, merged[i + 1][2])
+                # Extend next entry's start to absorb this one and prefer
+                # whichever variant has more characters (see forward pass).
+                chosen_text = text if len(text) > len(next_entry_text) else next_entry_text
+                merged[i + 1] = (chosen_text, start, merged[i + 1][2])
                 i += 1
                 continue
         result.append((text, start, end))
@@ -1424,7 +1430,7 @@ def auto_detect_crop(video_path, languages, width_mode):
         duration = _get_video_duration(video_path)
     except (subprocess.CalledProcessError, ValueError) as exc:
         print(f"auto-crop: could not read video metadata ({exc}); using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
 
     # Pick K windows from the middle 80% so OP/ED don't bias the clusters
     span_start = duration * 0.10
@@ -1460,7 +1466,7 @@ def auto_detect_crop(video_path, languages, width_mode):
         frames = sorted(Path(tmpdir).glob("*.png"))
         if not frames:
             print("auto-crop: no frames extracted; using default crop")
-            return DEFAULT_CROP
+            return DEFAULT_CROP, None
 
         _, frame_lines = detect_text_frames_screenai(
             frames, languages, num_workers=None, batch_size=64,
@@ -1469,11 +1475,11 @@ def auto_detect_crop(video_path, languages, width_mode):
     all_h = [h for lines in frame_lines for _, _, _, _, h in lines if h > 0]
     if not all_h:
         print("auto-crop: pre-scan found no text; using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
     cluster_ranges = cluster_heights(all_h)
     if not cluster_ranges:
         print("auto-crop: no height clusters formed; using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
 
     num_frames = len(frame_lines)
 
@@ -1565,7 +1571,7 @@ def auto_detect_crop(video_path, languages, width_mode):
 
     if not cluster_data:
         print("auto-crop: no scorable clusters; using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
 
     cluster_data.sort(key=lambda d: d["score"], reverse=True)
     print(f"auto-crop: {len(cluster_data)} cluster(s):", flush=True)
@@ -1579,7 +1585,7 @@ def auto_detect_crop(video_path, languages, width_mode):
     winner = cluster_data[0]
     if winner["score"] <= 0:
         print("auto-crop: top cluster scored zero; using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
 
     if len(cluster_data) >= 2:
         top1, top2 = cluster_data[0], cluster_data[1]
@@ -1633,14 +1639,14 @@ def auto_detect_crop(video_path, languages, width_mode):
 
     if w <= 0 or h <= 0:
         print("auto-crop: derived crop is empty; using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
     if w * h > 0.9 * iw * ih:
         print(f"auto-crop: derived crop {w}x{h} covers >90% of frame; using default crop")
-        return DEFAULT_CROP
+        return DEFAULT_CROP, None
 
     crop = f"{w}:{h}:{x1_i}:{y1_i}"
     print(f"auto-crop: selected cluster h=[{winner['cmin']},{winner['cmax']}] -> crop={crop}")
-    return crop
+    return crop, (int(winner["cmin"]), int(winner["cmax"]))
 
 
 def filter_blind_spot_bboxes(frame_lines, rect):
@@ -2005,8 +2011,11 @@ def main():
         sample_interval = 1.0 / fps
 
         crop = args.crop
+        auto_picked_cluster = None  # (cmin, cmax) of cluster auto-crop chose
         if not args.crop2 and crop == "auto":
-            crop = auto_detect_crop(video_path, args.languages, args.auto_crop_width)
+            crop, auto_picked_cluster = auto_detect_crop(
+                video_path, args.languages, args.auto_crop_width,
+            )
 
         with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
             print(f"Extracting frames ({fps} fps)...")
@@ -2048,20 +2057,46 @@ def main():
                 cluster_ranges = cluster_heights(all_h)
                 cluster_summary = summarize_clusters(raw_frame_lines, cluster_ranges, sample_interval)
 
+            chosen_idx = None
             if args.filter_cluster and cluster_ranges:
                 if args.filter_cluster == "biggest":
                     chosen_idx = len(cluster_ranges) - 1
                 else:
                     chosen_idx = int(args.filter_cluster)
-                if 0 <= chosen_idx < len(cluster_ranges):
-                    cmin, cmax = cluster_ranges[chosen_idx]
-                    raw_frame_lines = filter_height_cluster(raw_frame_lines, cmin, cmax)
-                    print(f"Cluster filter: kept cluster {chosen_idx} (h=[{cmin}, {cmax}])")
-                    all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
-                    fl_min_h, fl_max_h = _compute_line_height_range(all_h)
-                    ocr_texts = _build_texts_from_frame_lines(raw_frame_lines, len(frames), fl_min_h, fl_max_h)
-                else:
+                if not (0 <= chosen_idx < len(cluster_ranges)):
                     print(f"Cluster filter: index {chosen_idx} out of range (have {len(cluster_ranges)} clusters); skipping")
+                    chosen_idx = None
+            elif auto_picked_cluster and cluster_ranges and len(cluster_ranges) > 1:
+                # Auto-crop already decided which height range is the subtitle.
+                # Apply the equivalent of --filter-cluster so non-subtitle bboxes
+                # the wider crop swept in (e.g. live-stream chat overlays of a
+                # different size) don't pollute the SRT.
+                ap_mid = sum(auto_picked_cluster) / 2
+                best = None
+                best_dist = None
+                for i, (cmin, cmax) in enumerate(cluster_ranges):
+                    if cmin <= ap_mid <= cmax:
+                        best = i
+                        break
+                    centre = (cmin + cmax) / 2
+                    dist = abs(centre - ap_mid)
+                    if best_dist is None or dist < best_dist:
+                        best = i
+                        best_dist = dist
+                chosen_idx = best
+                if chosen_idx is not None:
+                    print(f"Auto-cluster filter: keeping cluster {chosen_idx} "
+                          f"(h=[{cluster_ranges[chosen_idx][0]}, {cluster_ranges[chosen_idx][1]}]) "
+                          f"to match the height range auto-crop picked "
+                          f"(h=[{auto_picked_cluster[0]}, {auto_picked_cluster[1]}])")
+
+            if chosen_idx is not None:
+                cmin, cmax = cluster_ranges[chosen_idx]
+                raw_frame_lines = filter_height_cluster(raw_frame_lines, cmin, cmax)
+                print(f"Cluster filter: kept cluster {chosen_idx} (h=[{cmin}, {cmax}])")
+                all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
+                fl_min_h, fl_max_h = _compute_line_height_range(all_h)
+                ocr_texts = _build_texts_from_frame_lines(raw_frame_lines, len(frames), fl_min_h, fl_max_h)
 
             # Filter watermark bboxes before building clips
             if args.watermark and raw_frame_lines is not None:
