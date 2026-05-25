@@ -503,22 +503,62 @@ def _compute_line_height_range(all_heights):
 
 
 def cluster_heights(all_heights):
-    """Group observed bbox heights into clusters separated by gaps.
+    """Split bbox heights into clusters at valleys in a smoothed histogram.
 
-    Two heights belong to the same cluster if they sit within max(3, 0.4*prev)
-    pixels of each other; a larger jump starts a new cluster.  Clusters with
-    fewer than max(5, 5% of samples) members are dropped as noise.  Returns a
-    list of (min_h, max_h) tuples sorted by ascending height.
+    Builds an integer histogram of heights, smooths it with a Gaussian kernel
+    whose width scales with the mean height, then walks the smoothed curve to
+    locate peaks (local maxima) and splits at the local minimum between each
+    pair of adjacent peaks.  This handles dense, continuous distributions that
+    a pure gap-based rule cannot separate.  Clusters with fewer than
+    max(5, 5% of samples) members are dropped as noise.  Returns a list of
+    (min_h, max_h) tuples sorted by ascending height.
     """
     if not all_heights:
         return []
+    import numpy as np
+
     sorted_h = sorted(all_heights)
-    clusters = [[sorted_h[0]]]
-    for h in sorted_h[1:]:
-        last = clusters[-1][-1]
-        if h - last > max(3, last * 0.4):
-            clusters.append([])
-        clusters[-1].append(h)
+    max_h = sorted_h[-1]
+    if max_h <= 0:
+        return []
+
+    hist = np.zeros(max_h + 2, dtype=np.float64)
+    for h in all_heights:
+        if h > 0:
+            hist[h] += 1
+
+    mean_h = sum(sorted_h) / len(sorted_h)
+    sigma = max(2.0, mean_h * 0.06)
+    radius = int(sigma * 3) + 1
+    kx = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-(kx ** 2) / (2 * sigma * sigma))
+    kernel /= kernel.sum()
+    smoothed = np.convolve(hist, kernel, mode="same")
+
+    peaks = [
+        i for i in range(1, len(smoothed) - 1)
+        if smoothed[i] > smoothed[i - 1] and smoothed[i] > smoothed[i + 1]
+    ]
+    if peaks:
+        peak_threshold = 0.05 * max(smoothed[p] for p in peaks)
+        peaks = [p for p in peaks if smoothed[p] >= peak_threshold]
+
+    boundaries = []
+    for left, right in zip(peaks, peaks[1:]):
+        boundaries.append(left + int(np.argmin(smoothed[left:right + 1])))
+
+    cluster_edges = [0] + boundaries + [max_h + 1]
+    clusters = []
+    j = 0
+    for lo, hi in zip(cluster_edges, cluster_edges[1:]):
+        members = []
+        while j < len(sorted_h) and sorted_h[j] < hi:
+            if sorted_h[j] >= lo:
+                members.append(sorted_h[j])
+            j += 1
+        if members:
+            clusters.append(members)
+
     min_size = max(5, len(all_heights) * 0.05)
     return [(c[0], c[-1]) for c in clusters if len(c) >= min_size]
 
