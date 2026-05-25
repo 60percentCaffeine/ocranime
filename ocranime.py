@@ -1594,10 +1594,21 @@ def auto_detect_crop(video_path, languages, width_mode):
     if width_mode == "full":
         x1, x2 = 0.0, float(iw)
     else:  # "pad"
+        # Pad the widest *seen* bbox by 20% per side, but enforce a floor of
+        # 70% of frame width centred on the cluster's horizontal centre.
+        # Pre-scan windows only sample ~5% of the video, so the widest seen
+        # bbox routinely undershoots the true widest subtitle; without the
+        # floor, long lines get truncated at the edges.
         widest = max(C, key=lambda b: b[3])
         wx, ww = widest[1], widest[3]
-        x1 = max(0.0, wx - 0.20 * ww)
-        x2 = min(float(iw), wx + ww + 0.20 * ww)
+        pad_x1 = wx - 0.20 * ww
+        pad_x2 = wx + ww + 0.20 * ww
+        centre_x = float(np.median([b[1] + b[3] / 2 for b in C]))
+        floor_w = 0.70 * iw
+        floor_x1 = centre_x - floor_w / 2
+        floor_x2 = centre_x + floor_w / 2
+        x1 = max(0.0, min(pad_x1, floor_x1))
+        x2 = min(float(iw), max(pad_x2, floor_x2))
 
     y1 = float(min(b[2] for b in C))
     y2 = float(max(b[2] + b[4] for b in C))
