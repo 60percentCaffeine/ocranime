@@ -17,6 +17,55 @@ MIN_CLIP_DURATION = 0.5  # seconds — clips shorter than this are dropped
 MAX_SUBTITLE_DURATION = 7.0  # seconds — subtitles longer than this are capped
 
 
+_YT_DLP_PATH_TAG = "__ocranime_path__:"
+
+
+def _download_via_yt_dlp(url):
+    """Download `url` via yt-dlp into cwd and return the local file path.
+
+    Cookies and other site-specific settings are expected to come from the
+    user's ~/.yt-dlp.conf — we don't pass any auth flags ourselves.
+
+    yt-dlp's normal status + progress output is streamed straight to the
+    terminal; the final filepath is identified by a tagged --print line.
+    """
+    if not shutil.which("yt-dlp"):
+        print("Error: yt-dlp is required for URL inputs but was not found in PATH",
+              file=sys.stderr)
+        sys.exit(1)
+
+    template = "%(title)s [%(id)s].%(ext)s"
+    cmd = [
+        "yt-dlp",
+        "--newline",  # progress lines use \n so we can stream them
+        "--print", f"after_move:{_YT_DLP_PATH_TAG}%(filepath)s",
+        "-o", template,
+        url,
+    ]
+    print(f"Downloading {url} ...", flush=True)
+    proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE, bufsize=1)
+    final_path = None
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        if line.startswith(_YT_DLP_PATH_TAG):
+            final_path = line[len(_YT_DLP_PATH_TAG):]
+        else:
+            print(line, flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        print(f"Error: yt-dlp failed for {url} (exit {proc.returncode})",
+              file=sys.stderr)
+        sys.exit(1)
+    if not final_path:
+        print(f"Error: yt-dlp produced no filepath for {url}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(final_path):
+        print(f"Error: yt-dlp reported {final_path!r} but the file is missing",
+              file=sys.stderr)
+        sys.exit(1)
+    return final_path
+
+
 def extract_frames(video_path, tmpdir, crop, fps):
     """Extract cropped frames from video using ffmpeg at given fps."""
     output_pattern = os.path.join(tmpdir, "%06d.png")
@@ -1874,7 +1923,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract hardsubs from anime video to SRT"
     )
-    parser.add_argument("video", nargs="+", help="Input video file path(s)")
+    parser.add_argument("video", nargs="+", help="Input video file path(s) or URL(s) (URLs are fetched via yt-dlp)")
     parser.add_argument(
         "--scan-backend",
         default="screenai",
@@ -1900,7 +1949,8 @@ def main():
         default="pad",
         choices=["pad", "full"],
         help=("How --crop=auto sets horizontal extents: 'pad' fits the widest "
-              "bbox and adds 20%% on each side, 'full' uses the whole frame width "
+              "bbox and adds 20%% on each side, with a floor of 70%% of the frame "
+              "width centred on the cluster; 'full' uses the whole frame width "
               "(default: pad)"),
     )
     parser.add_argument(
@@ -1955,6 +2005,11 @@ def main():
         metavar="biggest|N",
         help="Keep only bboxes from a single height cluster: 'biggest' picks the cluster with the largest height, or pass an integer index (0 = smallest height cluster, sorted ascending)",
     )
+    parser.add_argument(
+        "--raw-srt",
+        action="store_true",
+        help="Also write a <output>.raw.srt with the pre-cleanup entries",
+    )
     args = parser.parse_args()
 
     if args.blind_spot and args.crop2:
@@ -1983,11 +2038,13 @@ def main():
     if multi and args.output is not None and not os.path.isdir(args.output):
         os.makedirs(args.output, exist_ok=True)
 
-    # Validate all video files exist before starting
-    for video_path in args.video:
-        if not os.path.isfile(video_path):
-            print(f"Error: video file not found: {video_path}", file=sys.stderr)
-            sys.exit(1)
+    # Resolve inputs: existing local files pass through; anything else is
+    # handed to yt-dlp, which lets users pass URLs or bare IDs (e.g. a
+    # YouTube/Bilibili video ID) without a scheme prefix.
+    args.video = [
+        entry if os.path.isfile(entry) else _download_via_yt_dlp(entry)
+        for entry in args.video
+    ]
 
     for file_idx, video_path in enumerate(args.video):
         if multi:
@@ -2160,10 +2217,10 @@ def main():
             if smart_merged:
                 print(f"Smart dedup merged {smart_merged} single-frame entries")
             if args.cleanup_backend == "rules":
-                # Save raw (pre-cleanup) SRT alongside the final one
-                raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
-                write_srt(entries, raw_path)
-                print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
+                if args.raw_srt:
+                    raw_path = os.path.splitext(output_path)[0] + ".raw.srt"
+                    write_srt(entries, raw_path)
+                    print(f"Written {len(entries)} raw subtitle entries to {raw_path}")
 
                 print("Cleaning up OCR artifacts with rules-based cleanup...")
                 entries = cleanup_rules(entries, languages=args.languages)
