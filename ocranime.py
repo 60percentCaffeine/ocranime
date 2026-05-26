@@ -315,33 +315,36 @@ def detect_text_frames_apple(frames, languages, num_workers=None, batch_size=16)
     pool = ctx.Pool(processes=num_workers)
     warmup_results = [pool.apply_async(_apple_warmup, (languages,)) for _ in range(num_workers)]
 
-    # Pre-filter: skip frames that clearly have no text
+    # Pre-filter: skip frames that clearly have no text, and build the OCR
+    # plan without retaining one grayscale array per extracted frame.
     print("Pre-filtering frames...", end="", flush=True)
-    candidates = set()
-    frame_arrays = {}
-    for idx, frame in enumerate(frames):
-        arr = _load_frame_gray(frame)
-        frame_arrays[idx] = arr
-        dx = np.abs(np.diff(arr, axis=1))
-        dy = np.abs(np.diff(arr, axis=0))
-        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
-            candidates.add(idx)
-    edge_skipped = len(frames) - len(candidates)
-    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
-
-    # Build list of frames that need OCR (applying frame differencing)
-    texts = [""] * len(frames)
+    candidate_count = 0
+    reuse_sources = [None] * len(frames)
     ocr_indices = []
     diff_reused = 0
     last_ocr_arr = None
-    for idx in range(len(frames)):
-        if idx not in candidates:
-            last_ocr_arr = None
-        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
-            diff_reused += 1
+    last_ocr_idx = None
+    for idx, frame in enumerate(frames):
+        arr = _load_frame_gray(frame)
+        dx = np.abs(np.diff(arr, axis=1))
+        dy = np.abs(np.diff(arr, axis=0))
+        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
+            candidate_count += 1
+            if last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, arr):
+                diff_reused += 1
+                reuse_sources[idx] = last_ocr_idx
+            else:
+                ocr_indices.append(idx)
+                last_ocr_arr = arr
+                last_ocr_idx = idx
         else:
-            ocr_indices.append(idx)
-            last_ocr_arr = frame_arrays[idx]
+            last_ocr_arr = None
+            last_ocr_idx = None
+    edge_skipped = len(frames) - candidate_count
+    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
+
+    # Build per-frame OCR result placeholders.
+    texts = [""] * len(frames)
 
     if diff_reused:
         print(f"Frame differencing will reuse OCR for {diff_reused} frames")
@@ -373,25 +376,14 @@ def detect_text_frames_apple(frames, languages, num_workers=None, batch_size=16)
     pool.close()
     pool.join()
 
-    # Propagate OCR results to diff-reused frames
-    ocr_set = set(ocr_indices)
-    last_ocr_text = ""
-    last_ocr_arr = None
-    for idx in range(len(frames)):
-        if idx not in candidates:
-            last_ocr_text = ""
-            last_ocr_arr = None
-        elif idx in ocr_set:
-            last_ocr_text = texts[idx]
-            last_ocr_arr = frame_arrays[idx]
-        else:
-            if last_ocr_arr is not None:
-                texts[idx] = last_ocr_text
+    # Propagate OCR results to diff-reused frames.
+    for idx, source_idx in enumerate(reuse_sources):
+        if source_idx is not None:
+            texts[idx] = texts[source_idx]
 
     print()
     if diff_reused:
         print(f"Frame differencing reused OCR for {diff_reused} frames")
-    frame_arrays.clear()
     return texts
 
 
@@ -962,34 +954,37 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
     pool = ctx.Pool(processes=num_workers)
     warmup_results = [pool.apply_async(_screenai_warmup) for _ in range(num_workers)]
 
-    # Pre-filter: skip frames that clearly have no text (runs in main process
-    # concurrently with worker engine loading)
+    # Pre-filter: skip frames that clearly have no text and build the OCR plan
+    # without retaining one grayscale array per extracted frame. This runs in
+    # the main process concurrently with worker engine loading.
     print("Pre-filtering frames...", end="", flush=True)
-    candidates = set()
-    frame_arrays = {}
-    for idx, frame in enumerate(frames):
-        arr = _load_frame_gray(frame)
-        frame_arrays[idx] = arr
-        dx = np.abs(np.diff(arr, axis=1))
-        dy = np.abs(np.diff(arr, axis=0))
-        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
-            candidates.add(idx)
-    edge_skipped = len(frames) - len(candidates)
-    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
-
-    # Build list of frames that need OCR (applying frame differencing)
-    frame_lines = [[] for _ in frames]  # list of (text, height) per frame
+    candidate_count = 0
+    reuse_sources = [None] * len(frames)
     ocr_indices = []
     diff_reused = 0
     last_ocr_arr = None
-    for idx in range(len(frames)):
-        if idx not in candidates:
-            last_ocr_arr = None
-        elif last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, frame_arrays[idx]):
-            diff_reused += 1
+    last_ocr_idx = None
+    for idx, frame in enumerate(frames):
+        arr = _load_frame_gray(frame)
+        dx = np.abs(np.diff(arr, axis=1))
+        dy = np.abs(np.diff(arr, axis=0))
+        if float(np.mean(dx) + np.mean(dy)) >= PREFILTER_EDGE_THRESHOLD:
+            candidate_count += 1
+            if last_ocr_arr is not None and _frames_are_similar(last_ocr_arr, arr):
+                diff_reused += 1
+                reuse_sources[idx] = last_ocr_idx
+            else:
+                ocr_indices.append(idx)
+                last_ocr_arr = arr
+                last_ocr_idx = idx
         else:
-            ocr_indices.append(idx)
-            last_ocr_arr = frame_arrays[idx]
+            last_ocr_arr = None
+            last_ocr_idx = None
+    edge_skipped = len(frames) - candidate_count
+    print(f" {edge_skipped}/{len(frames)} frames skipped (no text edges)")
+
+    # Build per-frame OCR result placeholders.
+    frame_lines = [[] for _ in frames]  # list of (text, height) per frame
 
     if diff_reused:
         print(f"Frame differencing will reuse OCR for {diff_reused} frames")
@@ -1021,25 +1016,14 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
     pool.close()
     pool.join()
 
-    # Propagate OCR results to diff-reused frames
-    ocr_set = set(ocr_indices)
-    last_ocr_lines = []
-    last_ocr_arr = None
-    for idx in range(len(frames)):
-        if idx not in candidates:
-            last_ocr_lines = []
-            last_ocr_arr = None
-        elif idx in ocr_set:
-            last_ocr_lines = frame_lines[idx]
-            last_ocr_arr = frame_arrays[idx]
-        else:
-            if last_ocr_arr is not None:
-                frame_lines[idx] = last_ocr_lines
+    # Propagate OCR results to diff-reused frames.
+    for idx, source_idx in enumerate(reuse_sources):
+        if source_idx is not None:
+            frame_lines[idx] = frame_lines[source_idx]
 
     print()
     if diff_reused:
         print(f"Frame differencing reused OCR for {diff_reused} frames")
-    frame_arrays.clear()
 
     # Compute bbox height threshold from ALL frames, weighted by frame count.
     # Each height is counted once per frame it appears in (including
