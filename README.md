@@ -79,6 +79,7 @@ poetry run python ocranime.py video.mp4
 | `-o/--output` | Output SRT path, or output folder for multiple inputs | `<video>.srt` |
 | `--scan-backend` | OCR backend: `screenai`, `apple` | `screenai` |
 | `--fps` | Frames per second to sample | `4` |
+| `--quality` | Scale extracted frame width and height, e.g. `0.5` halves both | `1.0` |
 | `--crop` | ffmpeg crop filter, or `auto` | `auto` |
 | `--crop2 TOP BOTTOM` | OCR two crop regions stacked together | off |
 | `--cleanup-backend` | Cleanup backend: `none`, `rules` | `rules` |

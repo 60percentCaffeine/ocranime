@@ -2,12 +2,15 @@
 """Extract burned-in subtitles from anime videos into SRT using OCR."""
 
 import argparse
+import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import atexit
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -15,6 +18,7 @@ from pathlib import Path
 
 MIN_CLIP_DURATION = 0.5  # seconds — clips shorter than this are dropped
 MAX_SUBTITLE_DURATION = 7.0  # seconds — subtitles longer than this are capped
+SCREENAI_MAX_FRAME_DIMENSION = 2048  # GetMaxImageDimension() for the bundled model
 
 
 _YT_DLP_PATH_TAG = "__ocranime_path__:"
@@ -66,15 +70,44 @@ def _download_via_yt_dlp(url):
     return final_path
 
 
-def extract_frames(video_path, tmpdir, crop, fps):
-    """Extract cropped frames from video using ffmpeg at given fps."""
+def _scale_filter(quality):
+    """Return an ffmpeg scale filter for a frame-size multiplier."""
+    if quality == 1.0:
+        return None
+    q = f"{quality:.12f}".rstrip("0").rstrip(".")
+    return f"scale=iw*{q}:ih*{q}"
+
+
+def _dimension_clamp_filter(max_dimension):
+    """Return an aspect-preserving ffmpeg scale filter that never upscales."""
+    if max_dimension is None:
+        return None
+    limit = int(max_dimension)
+    return (
+        f"scale=w='min(iw,{limit})':h='min(ih,{limit})':"
+        "force_original_aspect_ratio=decrease"
+    )
+
+
+def extract_frames(video_path, tmpdir, crop, fps, quality=1.0, duration=None,
+                   max_dimension=None):
+    """Extract cropped, size-limited frames from video using ffmpeg."""
     output_pattern = os.path.join(tmpdir, "%06d.png")
+    filters = [f"crop={crop}", f"fps={fps}"]
+    if scale := _scale_filter(quality):
+        filters.append(scale)
+    if clamp := _dimension_clamp_filter(max_dimension):
+        filters.append(clamp)
     cmd = [
         "ffmpeg",
         "-i",
         video_path,
+    ]
+    if duration:
+        cmd += ["-t", duration]
+    cmd += [
         "-vf",
-        f"crop={crop},fps={fps}",
+        ",".join(filters),
         "-loglevel",
         "error",
         output_pattern,
@@ -84,19 +117,29 @@ def extract_frames(video_path, tmpdir, crop, fps):
     return frames
 
 
-def extract_frames_crop2(video_path, tmpdir, crop2, fps):
-    """Extract frames with two crop regions (top+bottom) vstacked, then sampled at given fps."""
+def extract_frames_crop2(video_path, tmpdir, crop2, fps, quality=1.0,
+                         duration=None, max_dimension=None):
+    """Extract, stack, and size-limit frames from two crop regions."""
     output_pattern = os.path.join(tmpdir, "%06d.png")
     top_crop, bottom_crop = crop2
+    output_filters = [f"[top][bottom]vstack", f"fps={fps}"]
+    if scale := _scale_filter(quality):
+        output_filters.append(scale)
+    if clamp := _dimension_clamp_filter(max_dimension):
+        output_filters.append(clamp)
     filter_complex = (
         f"[0:v]crop={top_crop}[top];"
         f"[0:v]crop={bottom_crop}[bottom];"
-        f"[top][bottom]vstack,fps={fps}"
+        f"{','.join(output_filters)}"
     )
     cmd = [
         "ffmpeg",
         "-i",
         video_path,
+    ]
+    if duration:
+        cmd += ["-t", duration]
+    cmd += [
         "-filter_complex",
         filter_complex,
         "-loglevel",
@@ -1903,7 +1946,123 @@ def write_srt(entries, output_path):
             f.write(f"{text}\n\n")
 
 
+def _ffprobe_streams(video_path):
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", video_path],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return json.loads(proc.stdout).get("streams", [])
+
+
+def _format_duration_seconds(video_path):
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", video_path],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return float(proc.stdout.strip())
+
+
+def _duration_to_seconds_str(duration):
+    if duration is None:
+        return None
+    if ":" not in duration:
+        return duration
+    total = 0.0
+    for part in duration.split(":"):
+        total = total * 60 + float(part)
+    return str(total)
+
+
+def _pgssub_streams(video_path):
+    return [
+        s for s in _ffprobe_streams(video_path)
+        if s.get("codec_type") == "subtitle"
+        and s.get("codec_name") in {"hdmv_pgs_subtitle", "pgssub"}
+    ]
+
+
+def _select_pgssub_stream(video_path, requested_index=None):
+    pgssubs = _pgssub_streams(video_path)
+    if requested_index is not None:
+        for s in pgssubs:
+            if s.get("index") == requested_index:
+                return s
+        raise SystemExit(f"Error: stream #{requested_index} is not a PGSSUB subtitle track")
+    return pgssubs[0] if pgssubs else None
+
+
+def _stream_output_path(output_path, stream):
+    root, ext = os.path.splitext(output_path)
+    tags = stream.get("tags") or {}
+    lang = (tags.get("language") or "und").lower()
+    return f"{root}.pgssub-{stream['index']}-{lang}{ext or '.srt'}"
+
+
+def _first_video_fps(video_path):
+    streams = _ffprobe_streams(video_path)
+    for s in streams:
+        if s.get("codec_type") == "video":
+            fps = s.get("avg_frame_rate") or s.get("r_frame_rate")
+            if fps and fps not in {"0/0", "N/A"}:
+                return fps
+    raise SystemExit(f"Error: could not determine video FPS for {video_path}")
+
+
+def _probe_sup_start_and_size(sup_path):
+    streams = _ffprobe_streams(sup_path)
+    if not streams:
+        raise SystemExit(f"Error: could not probe extracted SUP: {sup_path}")
+    s = streams[0]
+    width = s.get("width")
+    height = s.get("height")
+    start = s.get("start_time") or "0"
+    if not width or not height:
+        raise SystemExit(f"Error: could not determine PGSSUB canvas size from {sup_path}")
+    return float(start), int(width), int(height)
+
+
+def _burn_pgssub_to_black_video(video_path, stream_index, output_path, duration_limit=None):
+    """Extract a PGS subtitle stream and burn it onto a black video."""
+    output_path = str(output_path)
+    sup_path = os.path.splitext(output_path)[0] + ".sup"
+    duration = _duration_to_seconds_str(duration_limit) or str(_format_duration_seconds(video_path))
+    fps = _first_video_fps(video_path)
+
+    print(f"Extracting PGSSUB stream #0:{stream_index} to {sup_path}")
+    extract_cmd = ["ffmpeg", "-hide_banner", "-y"]
+    if duration_limit:
+        extract_cmd += ["-t", duration_limit]
+    extract_cmd += ["-i", video_path, "-map", f"0:{stream_index}", "-c:s", "copy", sup_path]
+    subprocess.run(extract_cmd, check=True)
+    if not os.path.exists(sup_path) or os.path.getsize(sup_path) == 0:
+        print(f"No PGSSUB packets extracted for stream #0:{stream_index}; writing empty result")
+        return None, sup_path
+
+    sub_start, width, height = _probe_sup_start_and_size(sup_path)
+    size = f"{width}x{height}"
+    print(f"Burning PGSSUB onto black {size} @ {fps}: {output_path}")
+    print(f"Applying subtitle start offset: {sub_start:.3f}s")
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s={size}:r={fps}:d={duration}",
+            "-itsoffset", str(sub_start), "-i", sup_path,
+            "-filter_complex", "[0:v][1:s:0]overlay=format=auto",
+            "-t", str(duration), "-an",
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            output_path,
+        ],
+        check=True,
+    )
+    return output_path, sup_path
+
+
 def main():
+    global PREFILTER_EDGE_THRESHOLD
     parser = argparse.ArgumentParser(
         description="Extract hardsubs from anime video to SRT"
     )
@@ -1941,6 +2100,16 @@ def main():
         "--fps", type=int, default=4, help="Frames per second to sample (default: 4)"
     )
     parser.add_argument(
+        "--duration",
+        help="Limit processing duration, e.g. 00:20:00 (useful for tests/samples)",
+    )
+    parser.add_argument(
+        "--quality",
+        type=float,
+        default=1.0,
+        help="Scale extracted frame width and height by this factor (default: 1.0; 0.5 halves both dimensions)",
+    )
+    parser.add_argument(
         "--languages",
         nargs="+",
         default=["zh-Hant"],
@@ -1970,6 +2139,12 @@ def main():
         help="Only generate subtitle frame PNGs in scanned_frames/, skip SRT generation",
     )
     parser.add_argument(
+        "--prefilter-edge-threshold",
+        type=float,
+        default=None,
+        help=f"Edge threshold for skipping frames before OCR (default: {PREFILTER_EDGE_THRESHOLD}; PGSSUB pipeline default: 0.1)",
+    )
+    parser.add_argument(
         "--bbox-csv",
         default=None,
         help="Write per-line bounding box data to a CSV file (line,bbx,bby,bbw,bbh,duration)",
@@ -1994,10 +2169,34 @@ def main():
         action="store_true",
         help="Also write a <output>.raw.srt with the pre-cleanup entries",
     )
+    parser.add_argument(
+        "--no-pgssub-pipeline",
+        action="store_true",
+        help="Disable automatic PGSSUB extraction/burn-to-black OCR pipeline",
+    )
+    parser.add_argument(
+        "--pgssub-stream",
+        type=int,
+        default=None,
+        help="Only OCR this global PGSSUB stream index. By default, all PGSSUB tracks are OCRed.",
+    )
+    parser.add_argument(
+        "--keep-pgssub-video",
+        action="store_true",
+        help="Keep the temporary black video created for PGSSUB OCR",
+    )
+    parser.add_argument(
+        "--pgssub-video-output",
+        default=None,
+        help="Write the black PGSSUB video here and keep it (single-input only)",
+    )
     args = parser.parse_args()
 
     if args.blind_spot and args.crop2:
         parser.error("--blind-spot is not supported with --crop2")
+
+    if not math.isfinite(args.quality) or args.quality <= 0:
+        parser.error("--quality must be a finite number greater than 0")
 
     if args.filter_cluster and args.filter_cluster != "biggest":
         try:
@@ -2019,6 +2218,10 @@ def main():
             )
 
     multi = len(args.video) > 1
+    if multi and args.pgssub_video_output is not None:
+        parser.error("--pgssub-video-output is only supported with a single input")
+    if args.pgssub_video_output is not None and args.pgssub_stream is None:
+        parser.error("--pgssub-video-output requires --pgssub-stream when OCRing all PGSSUB tracks")
     if multi and args.output is not None and not os.path.isdir(args.output):
         os.makedirs(args.output, exist_ok=True)
 
@@ -2042,6 +2245,89 @@ def main():
         else:
             output_path = args.output or (os.path.splitext(video_path)[0] + ".srt")
 
+        if not args.no_pgssub_pipeline and args.pgssub_stream is None:
+            pgssub_streams = _pgssub_streams(video_path)
+            if pgssub_streams:
+                print(f"Found {len(pgssub_streams)} PGSSUB subtitle track(s); OCRing all of them")
+                for stream in pgssub_streams:
+                    stream_output = _stream_output_path(output_path, stream)
+                    child_cmd = [
+                        sys.executable, os.path.abspath(__file__), video_path,
+                        "-o", stream_output,
+                        "--pgssub-stream", str(stream["index"]),
+                        "--scan-backend", args.scan_backend,
+                        "--fps", str(args.fps),
+                        "--quality", str(args.quality),
+                        "--cleanup-backend", args.cleanup_backend,
+                        "--auto-crop-width", args.auto_crop_width,
+                    ]
+                    if args.duration:
+                        child_cmd += ["--duration", args.duration]
+                    if args.languages:
+                        child_cmd += ["--languages", *args.languages]
+                    if args.scan_batch_size is not None:
+                        child_cmd += ["--scan-batch-size", str(args.scan_batch_size)]
+                    if args.scan_threads is not None:
+                        child_cmd += ["--scan-threads", str(args.scan_threads)]
+                    if args.watermark:
+                        child_cmd += ["--watermark", args.watermark]
+                    if args.filter_cluster:
+                        child_cmd += ["--filter-cluster", args.filter_cluster]
+                    if args.raw_srt:
+                        child_cmd.append("--raw-srt")
+                    if args.keep_pgssub_video:
+                        child_cmd.append("--keep-pgssub-video")
+                    if args.prefilter_edge_threshold is not None:
+                        child_cmd += ["--prefilter-edge-threshold", str(args.prefilter_edge_threshold)]
+                    tags = stream.get("tags") or {}
+                    print(f"\n--- PGSSUB stream #0:{stream['index']} ({tags.get('language', '')}) -> {stream_output} ---")
+                    subprocess.run(child_cmd, check=True)
+                continue
+
+        crop2 = args.crop2
+        pgssub_cleanup_dir = None
+        pgssub_pipeline_used = False
+        if not args.no_pgssub_pipeline:
+            pgssub_stream = _select_pgssub_stream(video_path, args.pgssub_stream)
+            if pgssub_stream is not None:
+                stream_index = pgssub_stream["index"]
+                tags = pgssub_stream.get("tags") or {}
+                title = tags.get("title", "")
+                lang = tags.get("language", "")
+                print(f"Using PGSSUB OCR pipeline with stream #0:{stream_index} ({lang}) {title}".rstrip())
+                if args.pgssub_video_output:
+                    pgssub_video = args.pgssub_video_output
+                elif args.keep_pgssub_video:
+                    pgssub_video = os.path.splitext(output_path)[0] + ".pgssub-black.mp4"
+                else:
+                    pgssub_cleanup_dir = tempfile.mkdtemp(prefix="ocranime_pgssub_")
+                    atexit.register(lambda p=pgssub_cleanup_dir: shutil.rmtree(p, ignore_errors=True))
+                    pgssub_video = os.path.join(pgssub_cleanup_dir, "pgssub-black.mp4")
+                os.makedirs(os.path.dirname(os.path.abspath(pgssub_video)), exist_ok=True)
+                video_path, sup_path = _burn_pgssub_to_black_video(video_path, stream_index, pgssub_video, args.duration)
+                if video_path is None:
+                    if args.scan_only:
+                        print("Scan-only mode: no subtitle packets in selected PGSSUB stream.")
+                    else:
+                        write_srt([], output_path)
+                        print(f"Written 0 subtitle entries to {output_path}")
+                    if pgssub_cleanup_dir:
+                        shutil.rmtree(pgssub_cleanup_dir, ignore_errors=True)
+                    continue
+                pgssub_pipeline_used = True
+                # The generated video is just black + subtitles, so OCR the full frame.
+                crop2 = None
+                if args.crop2:
+                    print("Ignoring --crop2 because PGSSUB pipeline uses the full generated subtitle canvas")
+            elif args.pgssub_stream is not None:
+                # _select_pgssub_stream exits for invalid requested streams; this is defensive.
+                raise SystemExit(f"Error: stream #{args.pgssub_stream} is not a PGSSUB subtitle track")
+
+        if args.prefilter_edge_threshold is not None:
+            PREFILTER_EDGE_THRESHOLD = args.prefilter_edge_threshold
+        elif pgssub_pipeline_used:
+            PREFILTER_EDGE_THRESHOLD = 0.1
+
         # Prepare scanned_frames directory (empty it on each run)
         scanned_dir = Path("scanned_frames")
         if scanned_dir.exists():
@@ -2050,21 +2336,62 @@ def main():
 
         fps = args.fps
         sample_interval = 1.0 / fps
+        quality = args.quality
 
-        crop = args.crop
-        auto_picked_cluster = None  # (cmin, cmax) of cluster auto-crop chose
-        if not args.crop2 and crop == "auto":
+        crop = "iw:ih:0:0" if pgssub_pipeline_used else args.crop
+        auto_picked_cluster = None  # (cmin, cmax) of auto-crop cluster in extracted-frame coords
+        if not crop2 and crop == "auto":
             crop, auto_picked_cluster = auto_detect_crop(
                 video_path, args.languages, args.auto_crop_width,
             )
 
         with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
-            print(f"Extracting frames ({fps} fps)...")
-            if args.crop2:
-                frames = extract_frames_crop2(video_path, tmpdir, args.crop2, fps)
+            quality_label = f", quality {quality:g}x" if quality != 1.0 else ""
+            max_dimension = None
+            dimension_label = ""
+            video_width, video_height = _get_video_dimensions(video_path)
+            if args.scan_backend == "screenai":
+                max_dimension = SCREENAI_MAX_FRAME_DIMENSION
+                if max(video_width, video_height) * quality > max_dimension:
+                    dimension_label = f", max {max_dimension}px"
+            print(f"Extracting frames ({fps} fps{quality_label}{dimension_label})...")
+            if crop2:
+                frames = extract_frames_crop2(
+                    video_path, tmpdir, crop2, fps, quality, args.duration,
+                    max_dimension=max_dimension,
+                )
             else:
-                frames = extract_frames(video_path, tmpdir, crop, fps)
-            print(f"Extracted {len(frames)} frames")
+                frames = extract_frames(
+                    video_path, tmpdir, crop, fps, quality, args.duration,
+                    max_dimension=max_dimension,
+                )
+            coordinate_scale = quality
+            if frames:
+                from PIL import Image
+                with Image.open(frames[0]) as first_frame:
+                    frame_width, frame_height = first_frame.size
+                print(f"Extracted {len(frames)} frames ({frame_width}x{frame_height})")
+
+                # Bboxes use post-clamp frame coordinates. Derive their actual
+                # scale relative to the crop rather than assuming --quality was
+                # the only resize applied.
+                if not crop2:
+                    try:
+                        crop_width_expr = crop.split(":", 1)[0]
+                        crop_width = _eval_ffmpeg_expr(
+                            crop_width_expr, video_width, video_height,
+                        )
+                        if crop_width > 0:
+                            coordinate_scale = frame_width / crop_width
+                    except (ValueError, SyntaxError):
+                        pass
+            else:
+                print("Extracted 0 frames")
+
+            if auto_picked_cluster is not None and coordinate_scale != 1.0:
+                auto_picked_cluster = tuple(
+                    h * coordinate_scale for h in auto_picked_cluster
+                )
 
             # OCR all frames
             batch_size = args.scan_batch_size
@@ -2076,13 +2403,18 @@ def main():
 
             # Filter blind-spot bboxes before watermark/clip-building.
             # iw/ih in the spec refer to the original video frame; the rect is
-            # then translated by the --crop offset so it lines up with bbox
-            # coordinates (which are in cropped-frame space).
+            # then translated by the --crop offset and scaled by --quality so it
+            # lines up with bbox coordinates (which are in extracted-frame space).
             if args.blind_spot and raw_frame_lines is not None:
                 vw, vh = _get_video_dimensions(video_path)
                 rect = parse_blind_spot(args.blind_spot, vw, vh)
                 cx, cy = _parse_crop_offsets(crop, vw, vh)
-                rect = (rect[0] - cx, rect[1] - cy, rect[2] - cx, rect[3] - cy)
+                rect = (
+                    (rect[0] - cx) * coordinate_scale,
+                    (rect[1] - cy) * coordinate_scale,
+                    (rect[2] - cx) * coordinate_scale,
+                    (rect[3] - cy) * coordinate_scale,
+                )
                 raw_frame_lines = filter_blind_spot_bboxes(raw_frame_lines, rect)
                 all_h = [h for lines in raw_frame_lines for _, _, _, _, h in lines if h > 0]
                 fl_min_h, fl_max_h = _compute_line_height_range(all_h)
@@ -2183,6 +2515,11 @@ def main():
 
             if args.scan_only:
                 print("Scan-only mode: skipping SRT generation.")
+                if pgssub_cleanup_dir:
+                    shutil.rmtree(pgssub_cleanup_dir, ignore_errors=True)
+                    print("Removed temporary PGSSUB black video")
+                elif pgssub_pipeline_used and (args.keep_pgssub_video or args.pgssub_video_output):
+                    print(f"Kept PGSSUB black video: {video_path}")
                 continue
 
             # Build entries from OCR results within detected clips
@@ -2215,6 +2552,11 @@ def main():
                 entries = fill_clip_gaps(entries, clips, sample_interval)
             write_srt(entries, output_path)
             print(f"Written {len(entries)} subtitle entries to {output_path}")
+            if pgssub_cleanup_dir:
+                shutil.rmtree(pgssub_cleanup_dir, ignore_errors=True)
+                print("Removed temporary PGSSUB black video")
+            elif pgssub_pipeline_used and (args.keep_pgssub_video or args.pgssub_video_output):
+                print(f"Kept PGSSUB black video: {video_path}")
 
 
 if __name__ == "__main__":
