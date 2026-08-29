@@ -67,7 +67,7 @@ poetry run python ocranime.py video.mp4
 ### How it works
 
 1. **Input resolution** — accepts local files, or downloads URLs/bare video IDs with yt-dlp when needed
-2. **Auto-crop + frame extraction** — finds the subtitle region by default, then extracts cropped frames with ffmpeg at 4 fps
+2. **Auto-crop + frame extraction** — finds the subtitle region by default, then extracts cropped frames with ffmpeg at 4 fps; PQ/HLG HDR inputs are automatically tone-mapped to BT.709 SDR
 3. **Fast OCR scan** — batches frames and can run worker processes in parallel; a typical 30 minute video usually finishes in a couple of minutes
 4. **Chrome Screen AI OCR** — recognizes subtitle text locally with Chrome Screen AI
 5. **Filtering + SRT generation** — removes optional watermarks, blind spots, and non-subtitle text clusters, useful for chat/UI overlays in YouTube/Bilibili videos; then groups subtitle frames, deduplicates OCR, and applies rules-based cleanup by default

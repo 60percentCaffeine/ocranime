@@ -89,11 +89,40 @@ def _dimension_clamp_filter(max_dimension):
     )
 
 
+HDR_COLOR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
+HDR_TO_SDR_FILTERS = (
+    "zscale=transfer=linear:npl=100",
+    "format=gbrpf32le",
+    "zscale=primaries=bt709",
+    "tonemap=tonemap=mobius:desat=0",
+    "zscale=transfer=bt709:matrix=bt709:range=tv",
+    "format=rgb24",
+)
+
+
+def _video_is_hdr(video_path):
+    """Return whether the first video stream uses a PQ or HLG transfer."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=color_transfer",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip().lower() in HDR_COLOR_TRANSFERS
+
+
+def _append_hdr_to_sdr_filters(filters, video_path):
+    """Add a linear-light HDR-to-BT.709 tone map when the input is HDR."""
+    if _video_is_hdr(video_path):
+        filters.extend(HDR_TO_SDR_FILTERS)
+
+
 def extract_frames(video_path, tmpdir, crop, fps, quality=1.0, duration=None,
                    max_dimension=None):
     """Extract cropped, size-limited frames from video using ffmpeg."""
     output_pattern = os.path.join(tmpdir, "%06d.png")
     filters = [f"crop={crop}", f"fps={fps}"]
+    _append_hdr_to_sdr_filters(filters, video_path)
     if scale := _scale_filter(quality):
         filters.append(scale)
     if clamp := _dimension_clamp_filter(max_dimension):
@@ -123,6 +152,7 @@ def extract_frames_crop2(video_path, tmpdir, crop2, fps, quality=1.0,
     output_pattern = os.path.join(tmpdir, "%06d.png")
     top_crop, bottom_crop = crop2
     output_filters = [f"[top][bottom]vstack", f"fps={fps}"]
+    _append_hdr_to_sdr_filters(output_filters, video_path)
     if scale := _scale_filter(quality):
         output_filters.append(scale)
     if clamp := _dimension_clamp_filter(max_dimension):
@@ -554,8 +584,10 @@ def _screenai_perform_ocr(engine, img):
 # Lines outside this height range (relative to median) are treated as noise.
 # Below: small UI text (watermarks, usernames, timestamps).
 # Above: large background text (title cards, signs, logos).
-_BBOX_HEIGHT_RATIO_MIN = 0.75
-_BBOX_HEIGHT_RATIO_MAX = 1.5
+# Keep this broad: ScreenAI's bbox heights can be bimodal even for legitimate
+# subtitles in one video (for example, modes near 40px and 80px).
+_BBOX_HEIGHT_RATIO_MIN = 0.5
+_BBOX_HEIGHT_RATIO_MAX = 1.75
 
 
 def _parse_response_lines(response_lines):
@@ -1522,6 +1554,8 @@ def auto_detect_crop(video_path, languages, width_mode):
 
     print(f"auto-crop: pre-scanning {len(starts)} windows × {WINDOW_DUR}s @ {fps}fps "
           f"(video {iw}x{ih}, duration {duration:.0f}s)...")
+    pre_scan_filters = [f"fps={fps}"]
+    _append_hdr_to_sdr_filters(pre_scan_filters, video_path)
 
     with tempfile.TemporaryDirectory(prefix="ocranime_autocrop_") as tmpdir:
         for window_idx, start_t in enumerate(starts):
@@ -1530,7 +1564,7 @@ def auto_detect_crop(video_path, languages, width_mode):
                 "-ss", f"{start_t:.3f}",
                 "-i", str(video_path),
                 "-t", str(WINDOW_DUR),
-                "-vf", f"fps={fps}",
+                "-vf", ",".join(pre_scan_filters),
                 "-loglevel", "error",
                 os.path.join(tmpdir, f"w{window_idx:02d}_%06d.png"),
             ]
@@ -1723,6 +1757,20 @@ def auto_detect_crop(video_path, languages, width_mode):
     crop = f"{w}:{h}:{x1_i}:{y1_i}"
     print(f"auto-crop: selected cluster h=[{winner['cmin']},{winner['cmax']}] -> crop={crop}")
     return crop, (int(winner["cmin"]), int(winner["cmax"]))
+
+
+def print_crop_recommendations(recommendations):
+    """Print reusable --crop arguments selected by auto-crop."""
+    if not recommendations:
+        return
+    print()
+    if len(recommendations) == 1:
+        _, crop = recommendations[0]
+        print(f'Recommended crop filter: --crop "{crop}"')
+        return
+    print("Recommended crop filters:")
+    for video_path, crop in recommendations:
+        print(f'  {video_path}: --crop "{crop}"')
 
 
 def filter_blind_spot_bboxes(frame_lines, rect):
@@ -2233,6 +2281,8 @@ def main():
         for entry in args.video
     ]
 
+    crop_recommendations = []
+
     for file_idx, video_path in enumerate(args.video):
         if multi:
             print(f"\n{'='*60}")
@@ -2344,6 +2394,7 @@ def main():
             crop, auto_picked_cluster = auto_detect_crop(
                 video_path, args.languages, args.auto_crop_width,
             )
+            crop_recommendations.append((video_path, crop))
 
         with tempfile.TemporaryDirectory(prefix="ocranime_") as tmpdir:
             quality_label = f", quality {quality:g}x" if quality != 1.0 else ""
@@ -2557,6 +2608,8 @@ def main():
                 print("Removed temporary PGSSUB black video")
             elif pgssub_pipeline_used and (args.keep_pgssub_video or args.pgssub_video_output):
                 print(f"Kept PGSSUB black video: {video_path}")
+
+    print_crop_recommendations(crop_recommendations)
 
 
 if __name__ == "__main__":
