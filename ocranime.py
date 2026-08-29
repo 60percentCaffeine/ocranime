@@ -1121,10 +1121,12 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
 
 def format_timestamp(seconds):
     """Format seconds as SRT timestamp HH:MM:SS,mmm."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
+    # Round once before splitting the fields so 999.999... ms carries into
+    # the next second instead of producing the invalid four-digit value 1000.
+    total_ms = int(round(seconds * 1000))
+    h, remainder = divmod(total_ms, 3_600_000)
+    m, remainder = divmod(remainder, 60_000)
+    s, ms = divmod(remainder, 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
