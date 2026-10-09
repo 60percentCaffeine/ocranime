@@ -1523,7 +1523,7 @@ def _is_target_char(ch, languages):
     return False
 
 
-def auto_detect_crop(video_path, languages, width_mode):
+def auto_detect_crop(video_path, languages, width_mode, num_workers=None):
     """Auto-detect ffmpeg crop region by pre-scanning the video.
 
     Returns an ffmpeg crop string ``w:h:x:y``.  Falls back to ``DEFAULT_CROP``
@@ -1554,10 +1554,15 @@ def auto_detect_crop(video_path, languages, width_mode):
         offset = max(0.0, (slot - WINDOW_DUR) / 2)
         starts = [span_start + i * slot + offset for i in range(K)]
 
+    # Commentary videos can use a different subtitle size/layout in the intro.
+    if starts[0] > WINDOW_DUR:
+        starts.insert(0, 0.0)
+
     print(f"auto-crop: pre-scanning {len(starts)} windows × {WINDOW_DUR}s @ {fps}fps "
           f"(video {iw}x{ih}, duration {duration:.0f}s)...")
     pre_scan_filters = [f"fps={fps}"]
     _append_hdr_to_sdr_filters(pre_scan_filters, video_path)
+    pre_scan_filters.append(_dimension_clamp_filter(SCREENAI_MAX_FRAME_DIMENSION))
 
     with tempfile.TemporaryDirectory(prefix="ocranime_autocrop_") as tmpdir:
         for window_idx, start_t in enumerate(starts):
@@ -1580,9 +1585,28 @@ def auto_detect_crop(video_path, languages, width_mode):
             print("auto-crop: no frames extracted; using default crop")
             return DEFAULT_CROP, None
 
+        from PIL import Image
+        with Image.open(frames[0]) as frame:
+            sx, sy = iw / frame.width, ih / frame.height
         _, frame_lines = detect_text_frames_screenai(
-            frames, languages, num_workers=None, batch_size=64,
+            frames, languages, num_workers=num_workers, batch_size=64,
         )
+
+    # Screen AI returns coordinates in the resized image, not the source video.
+    frame_lines = [
+        [(text, x * sx, y * sy, w * sx, int(round(h * sy)))
+         for text, x, y, w, h in lines]
+        for lines in frame_lines
+    ]
+    # Dense browser UI/chat can erase subtitle peaks in the global histogram.
+    # Cluster plausible subtitle sizes first; retain the old fallback for
+    # videos whose subtitles are unusually small or large.
+    plausible_lines = [
+        [b for b in lines if ih * 0.025 <= b[4] <= ih * 0.10]
+        for lines in frame_lines
+    ]
+    if sum(map(len, plausible_lines)) >= 5:
+        frame_lines = plausible_lines
 
     all_h = [h for lines in frame_lines for _, _, _, _, h in lines if h > 0]
     if not all_h:
@@ -1632,9 +1656,9 @@ def auto_detect_crop(video_path, languages, width_mode):
 
         heights_all = np.array([b[4] for b in bboxes], dtype=np.float64)
         median_h_all = float(np.median(heights_all))
-        # Allow ~4 text-heights of vertical room: a tight one- or two-line band
-        # plus a little slack for line-spacing jitter.
-        band_h = max(8.0, 4.0 * median_h_all)
+        # Allow two subtitle baselines with normal line spacing, without
+        # mixing the band with nearby article paragraphs or live-stream chat.
+        band_h = max(8.0, 1.5 * median_h_all)
         band_bboxes = _densest_y_band(bboxes, band_h)
         if not band_bboxes:
             band_bboxes = bboxes
@@ -2395,6 +2419,7 @@ def main():
         if not crop2 and crop == "auto":
             crop, auto_picked_cluster = auto_detect_crop(
                 video_path, args.languages, args.auto_crop_width,
+                num_workers=args.scan_threads,
             )
             crop_recommendations.append((video_path, crop))
 
@@ -2492,29 +2517,16 @@ def main():
                 if not (0 <= chosen_idx < len(cluster_ranges)):
                     print(f"Cluster filter: index {chosen_idx} out of range (have {len(cluster_ranges)} clusters); skipping")
                     chosen_idx = None
-            elif auto_picked_cluster and cluster_ranges and len(cluster_ranges) > 1:
-                # Auto-crop already decided which height range is the subtitle.
-                # Apply the equivalent of --filter-cluster so non-subtitle bboxes
-                # the wider crop swept in (e.g. live-stream chat overlays of a
-                # different size) don't pollute the SRT.
-                ap_mid = sum(auto_picked_cluster) / 2
-                best = None
-                best_dist = None
-                for i, (cmin, cmax) in enumerate(cluster_ranges):
-                    if cmin <= ap_mid <= cmax:
-                        best = i
-                        break
-                    centre = (cmin + cmax) / 2
-                    dist = abs(centre - ap_mid)
-                    if best_dist is None or dist < best_dist:
-                        best = i
-                        best_dist = dist
-                chosen_idx = best
-                if chosen_idx is not None:
-                    print(f"Auto-cluster filter: keeping cluster {chosen_idx} "
-                          f"(h=[{cluster_ranges[chosen_idx][0]}, {cluster_ranges[chosen_idx][1]}]) "
-                          f"to match the height range auto-crop picked "
-                          f"(h=[{auto_picked_cluster[0]}, {auto_picked_cluster[1]}])")
+            elif auto_picked_cluster and raw_frame_lines is not None:
+                # Keep the selected range, not whichever post-crop histogram
+                # cluster happens to contain its midpoint. OCR can split one
+                # subtitle font into several modes or merge it with outliers.
+                # Allow modest bbox jitter after cropping/resizing.
+                cmin = auto_picked_cluster[0] * 0.8
+                cmax = auto_picked_cluster[1] * 1.2
+                raw_frame_lines = filter_height_cluster(raw_frame_lines, cmin, cmax)
+                ocr_texts = _build_texts_from_frame_lines(raw_frame_lines, len(frames), 0, 0)
+                print(f"Auto-cluster filter: keeping h=[{cmin:.1f}, {cmax:.1f}]")
 
             if chosen_idx is not None:
                 cmin, cmax = cluster_ranges[chosen_idx]

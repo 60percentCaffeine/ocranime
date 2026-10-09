@@ -5,3 +5,4 @@ test.raw.srt
 __pycache__
 screenai_protos/*_pb2.py
 scanned_frames/
+tests/fixtures/CfGdnxdbQ7o-opening.webm

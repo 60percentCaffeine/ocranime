@@ -110,3 +110,14 @@ poetry run python ocranime.py video.mp4 --filter-cluster biggest
 # Just detect subtitle frames without full OCR
 poetry run python ocranime.py video.mp4 --scan-only
 ```
+
+## Tests
+
+```sh
+poetry run python -m unittest discover -s tests -v
+```
+
+Includes an optional single-worker CLI regression test using a local-only
+six-second 1440p video clip (skipped if absent). See
+[fixture documentation](tests/fixtures/README.md) for dependencies,
+resource limits, expected subtitles, and replaying the test against old code.
