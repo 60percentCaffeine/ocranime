@@ -78,6 +78,7 @@ poetry run python ocranime.py video.mp4
 |------|-------------|---------|
 | `-o/--output` | Output SRT path, or output folder for multiple inputs | `<video>.srt` |
 | `--scan-backend` | OCR backend: `screenai`, `apple` | `screenai` |
+| `--scan-threads` | OCR worker processes; an explicit count overrides automatic memory budgeting | CPU count, capped by RAM for Screen AI |
 | `--fps` | Frames per second to sample | `4` |
 | `--quality` | Scale extracted frame width and height, e.g. `0.5` halves both | `1.0` |
 | `--crop` | ffmpeg crop filter, or `auto` | `auto` |
@@ -88,6 +89,15 @@ poetry run python ocranime.py video.mp4
 | `--blind-spot W:H:X:Y` | Ignore a fixed region in the source frame | off |
 | `--filter-cluster biggest\|N` | Keep one detected text-height cluster | off |
 | `--raw-srt` | Also write pre-cleanup subtitles | off |
+
+Screen AI budgets 2 GiB per worker and leaves 1 GiB headroom, using available
+Linux RAM and cgroup memory limits. CPU count remains the upper limit. The
+selected count is printed when memory reduces automatic parallelism.
+
+On Linux, workers return unused native heap pages after each OCR sub-batch.
+Model callbacks read directly into Screen AI's buffers to avoid retaining
+large temporary Python copies on native fiber stacks under CPython 3.14
+([upstream issue](https://github.com/python/cpython/issues/157519)).
 
 ### Examples
 
@@ -117,7 +127,12 @@ poetry run python ocranime.py video.mp4 --scan-only
 poetry run python -m unittest discover -s tests -v
 ```
 
-Includes an optional single-worker CLI regression test using a local-only
-six-second 1440p video clip (skipped if absent). See
+Includes optional single-worker CLI regression tests using local-only
+clips of at most six seconds: opening captions, small dialogue, long-line
+auto-crop truncation, subtitle height modes, and embedded PGS subtitles
+(skipped if absent). Four separately marked expected failures document
+unresolved auto-crop behavior. See
 [fixture documentation](tests/fixtures/README.md) for dependencies,
 resource limits, expected subtitles, and replaying the test against old code.
+The native callback memory regression test also checks repeated model reloads
+when local Screen AI resources and glibc allocator accounting are available.

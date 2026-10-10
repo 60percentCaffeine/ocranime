@@ -513,8 +513,19 @@ def _load_screenai():
     def get_file_content(p, s, ptr):
         path = model_dir / p.decode("utf-8")
         if path.exists():
-            with open(path, "rb") as f:
-                ctypes.memmove(ptr, f.read(s), s)
+            # Screen AI invokes this on native fiber stacks. CPython 3.14 can
+            # defer destruction of callback temporaries indefinitely there
+            # (python/cpython#157519), retaining whole f.read() model copies.
+            # Read directly into the destination owned by the library instead.
+            buffer = (ctypes.c_char * s).from_address(ptr)
+            with open(path, "rb", buffering=0) as f:
+                view = memoryview(buffer).cast("B")
+                offset = 0
+                while offset < s:
+                    count = f.readinto(view[offset:])
+                    if not count:
+                        raise OSError(f"Unexpected EOF reading Screen AI model: {path}")
+                    offset += count
 
     # ── configure function signatures ───────────────────────────────────
     lib.SetFileContentFunctions.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -530,10 +541,20 @@ def _load_screenai():
     lib.SetOCRLightMode(False)
     max_pixel_size = lib.GetMaxImageDimension()
 
+    malloc_trim = None
+    if sys.platform == "linux":
+        # Native inference frees large model/workspace allocations, but glibc
+        # can retain over a GiB of unused resident heap in each worker.
+        malloc_trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+
     _screenai_engine = {
         "lib": lib,
         "SkBitmap": SkBitmap,
         "max_pixel_size": max_pixel_size,
+        "malloc_trim": malloc_trim,
         # prevent garbage-collection of the callback pointers
         "_cb_size": get_file_content_size,
         "_cb_content": get_file_content,
@@ -720,7 +741,7 @@ def _screenai_ocr_image(engine, img):
             for text, bbox in _parse_response_lines(response.get("lines", []))]
 
 
-def _screenai_ocr_concat(engine, images):
+def _screenai_ocr_concat(engine, images, close_images=False):
     """OCR multiple images in one call by concatenating them vertically.
 
     Returns a list of per-frame line data.  Each element is a list of
@@ -734,6 +755,9 @@ def _screenai_ocr_concat(engine, images):
     If the concatenated height would exceed max_pixel_size, the batch is split
     into sub-batches that each fit within the limit to avoid quality-destroying
     downscale.
+
+    When close_images is true, consume owned images and release each completed
+    sub-batch immediately instead of retaining decoded pixels for the whole task.
     """
     from PIL import Image
 
@@ -774,20 +798,34 @@ def _screenai_ocr_concat(engine, images):
         sb_heights = frame_heights[sb_start:sb_end]
 
         if len(sb_images) == 1:
-            all_results[sb_start] = _screenai_ocr_image(engine, sb_images[0])
+            try:
+                all_results[sb_start] = _screenai_ocr_image(engine, sb_images[0])
+            finally:
+                if close_images:
+                    sb_images[0].close()
+                    images[sb_start].close()
+                    if trim := engine.get("malloc_trim"):
+                        trim(0)
             continue
 
         total_h = sum(sb_heights)
         concat = Image.new("RGB", (target_w, total_h))
         y_off = 0
         boundaries = []
-        for img, fh in zip(sb_images, sb_heights):
-            concat.paste(img, (0, y_off))
-            boundaries.append((y_off, y_off + fh))
-            y_off += fh
+        try:
+            for img, fh in zip(sb_images, sb_heights):
+                concat.paste(img, (0, y_off))
+                boundaries.append((y_off, y_off + fh))
+                y_off += fh
 
-        response = _screenai_perform_ocr(engine, concat)
-        concat.close()
+            response = _screenai_perform_ocr(engine, concat)
+        finally:
+            concat.close()
+            if close_images:
+                for img in sb_images + images[sb_start:sb_end]:
+                    img.close()
+                if trim := engine.get("malloc_trim"):
+                    trim(0)
 
         # Assign each line to a frame based on bounding box Y center
         frame_lines = [[] for _ in sb_images]
@@ -842,10 +880,14 @@ def _screenai_worker_ocr(task):
         _screenai_worker_ocr._stderr_suppressed = True
     engine = _load_screenai()
     images = [Image.open(p) for p in frame_paths]
-    frame_lines = _screenai_ocr_concat(engine, images)
-    for img in images:
-        img.close()
-    return indices, frame_lines
+    try:
+        frame_lines = _screenai_ocr_concat(engine, images, close_images=True)
+        return indices, frame_lines
+    finally:
+        for img in images:
+            img.close()
+        if trim := engine.get("malloc_trim"):
+            trim(0)
 
 
 
@@ -1003,6 +1045,43 @@ def _build_texts_from_frame_lines(frame_lines, num_frames, min_h, max_h):
     return texts
 
 
+# Dense 1440p video measured up to ~1.5 GiB per native OCR worker. Leave room
+# for inference peaks, decoded pixels, and activity elsewhere in the system.
+SCREENAI_WORKER_MEMORY_BYTES = 2 * 1024**3
+SCREENAI_MEMORY_HEADROOM_BYTES = 1024**3
+
+
+def _screenai_available_memory():
+    """Return Linux available RAM, bounded by remaining cgroup v2 budgets."""
+    try:
+        available = next(
+            int(line.split()[1]) * 1024
+            for line in Path('/proc/meminfo').read_text().splitlines()
+            if line.startswith('MemAvailable:')
+        )
+    except (OSError, ValueError, StopIteration):
+        return None
+
+    try:
+        relative = next(
+            line.split('::', 1)[1]
+            for line in Path('/proc/self/cgroup').read_text().splitlines()
+            if line.startswith('0::')
+        )
+        root = Path('/sys/fs/cgroup')
+        group = (root / relative.lstrip('/')).resolve()
+        for parent in (group, *group.parents):
+            if not parent.is_relative_to(root):
+                break
+            limit = (parent / 'memory.max').read_text().strip()
+            if limit != 'max':
+                used = int((parent / 'memory.current').read_text())
+                available = min(available, max(0, int(limit) - used))
+    except (OSError, ValueError, StopIteration):
+        pass
+    return available
+
+
 def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=1):
     """OCR frames using Chrome Screen AI with parallel processes for speed.
 
@@ -1020,6 +1099,13 @@ def detect_text_frames_screenai(frames, languages, num_workers=None, batch_size=
 
     if num_workers is None:
         num_workers = max(os.cpu_count() or 1, 1)
+        if (available := _screenai_available_memory()) is not None:
+            budget = max(0, available - SCREENAI_MEMORY_HEADROOM_BYTES)
+            memory_workers = max(1, budget // SCREENAI_WORKER_MEMORY_BYTES)
+            if memory_workers < num_workers:
+                num_workers = memory_workers
+                print(f"Screen AI: {num_workers} workers within the available "
+                      f"{available / 1024**3:.1f} GiB RAM budget", flush=True)
 
     # Ensure model files are downloaded before spawning workers
     _ensure_screenai_downloaded()
@@ -2205,7 +2291,7 @@ def main():
         "--scan-threads",
         type=int,
         default=None,
-        help="Number of worker processes for apple/screenai backends (default: 1)",
+        help="Worker processes (default: CPU count, capped by available RAM for Screen AI)",
     )
     parser.add_argument(
         "--scan-only",
